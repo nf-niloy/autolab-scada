@@ -1,21 +1,7 @@
-# AutoLab SCADA · Public-page-to-local Arduino mode
+# AutoLab SCADA live control
 
-## Intended workflow
+The frontend runs in any browser as a GitHub Pages static application. Live data is supplied by a backend on the Arduino-connected laptop. Locally it uses `http://127.0.0.1:8000`; optional Tailscale Funnel permits a remote HTTPS URL configured in `src/remote-config.js`.
 
-1. Serve the frontend as a static GitHub Pages site (HTTPS).
-2. Start the FastAPI + PySerial service locally on `127.0.0.1:8000`.
-3. If Chrome requests Local Network Access / loopback permission, allow it for this site.
-4. Frontend polls `http://127.0.0.1:8000/api/status` about every 1.8 seconds.
-5. Backend connected + fresh Arduino telemetry → welcome `SYSTEM LIVE` status, with real readings after private login. No backend → demo is available; backend but no Arduino → Arduino offline with simulation available.
-6. Operator takes the short pairing code from the backend terminal and unlocks controls. Backend authorizes using a bearer token held in sessionStorage in this tab. Browser permission alone never authorizes actuator commands.
-7. Live HTTP POST endpoints go to the loopback backend, which in turn sends framed serial commands to the Uno; polling updates output states and progress.
+**Authentication:** run `python backend/setup_pin.py` once, storing a salted password hash in ignored `backend/.local/`. The browser uses the fixed PIN only for login, then receives a short-lived random bearer token stored in that tab's sessionStorage. The PIN is not printed or served by GitHub Pages. Visit `docs/REMOTE_ACCESS.md` for deployment steps.
 
-### Practical limitations
-
-Modern browsers can gate cross-origin access to the loopback address space behind a Local Network Access permission dialog. Browser prompts/permissions cannot be bypassed by the app. Standard cross-origin response headers are restricted to the GitHub Pages origin. Keep the Python service local, with no public port exposure.
-
-### Safety architecture
-
-Controller firmware: physical output shutdown/watchdog and mutual exclusion. Backend: strict input bounds, serialization, acknowledgement handling, pairing token, explicit CORS origin allowlist. Frontend: labels read-only vs paired mode, disables stale controls, never claims physical relay feedback. A physical emergency cutoff is still required.
-
-The public site does not run Python or contain hardware credentials. The six-digit pairing code appears only in the operator's own local backend terminal. Restarting the server rotates credentials.
+**Safety:** firmware enforces output interlock and serial timeout; backend validates recipes and commands, denies unauthenticated operations, and stops active controls on browser heartbeat timeout. Browser STOP and software safeguards are not certified safety devices. Keep the Arduino and loads physically supervised, and provide a physical power disconnect.

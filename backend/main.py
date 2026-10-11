@@ -1,4 +1,4 @@
-"""AutoLab SCADA local bridge. Never expose this server beyond loopback.
+"""AutoLab SCADA bridge. Bind to loopback; optional public access via Tailscale Funnel only.
 
 Run: python -m uvicorn main:app --host 127.0.0.1 --port 8000
 Arduino firmware protocol: CMD,<id>,<action>,... / ACK / DATA / EVENT.
@@ -9,6 +9,8 @@ import asyncio
 import copy
 import csv
 import io
+import hashlib
+import hmac
 import json
 import os
 import queue
@@ -19,6 +21,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager,contextmanager,closing
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import serial
@@ -35,10 +38,103 @@ ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(__file__).resolve().parent / 'autolab_history.sqlite3'
 # Only exact front-end origins may access this loopback-only service.
 APP_ORIGINS = {'https://nf-niloy.github.io', 'http://127.0.0.1:8000', 'http://localhost:8000'}
-PAIR_CODE = f'{secrets.randbelow(1_000_000):06d}'
-CONTROL_TOKEN = secrets.token_urlsafe(36)
-PAIR_FAILURES = deque(maxlen=50)
-AUTH_UNTIL = 0.0
+PRIVATE = Path(__file__).resolve().parent / '.local'
+CREDS = PRIVATE / 'credentials.json'
+FAILURES = PRIVATE / 'login_lockout.json'
+REMOTE = PRIVATE / 'remote.json'
+
+
+def remote_url():
+    if not REMOTE.is_file():
+        return ''
+    url = json.loads(REMOTE.read_text(encoding='utf-8')).get('url','').rstrip('/')
+    parts = urlsplit(url)
+    if parts.scheme != 'https' or not parts.hostname or not parts.hostname.endswith('.ts.net') or parts.port or parts.username or parts.password or parts.path:
+        raise RuntimeError('Invalid remote host config: only a plain https://YOUR-DEVICE.ts.net URL is accepted')
+    return url
+
+PUBLIC_URL = remote_url()
+REMOTE_HOST = urlsplit(PUBLIC_URL).hostname if PUBLIC_URL else None
+
+LOGIN_LOCK = threading.RLock()
+SESSIONS = {}  # token hash -> {expires, last_seen}; ephemeral across restarts
+CONTROL_LAST_SEEN = 0.0
+CONTROL_ACTIVE = False
+LOGIN_LOCK_SECONDS = 3600
+SESSION_SECONDS = 2*3600
+CONTROL_LEASE_SECONDS = 25
+
+
+def current_credentials():
+    if not CREDS.is_file():
+        return None
+    payload = json.loads(CREDS.read_text(encoding='utf-8'))
+    if payload.get('iterations',0) < 300_000:
+        raise RuntimeError('Invalid credential setup: run python backend/setup_pin.py')
+    return payload
+
+
+def correct_pin(candidate):
+    payload = current_credentials()
+    if not payload:
+        return False
+    computed = hashlib.pbkdf2_hmac('sha256',candidate.encode('ascii'),bytes.fromhex(payload['salt']),payload['iterations'])
+    return hmac.compare_digest(computed, bytes.fromhex(payload['hash']))
+
+
+def check_lockout():
+    if not FAILURES.is_file():
+        return {'failed':0,'until':0.0}
+    data = json.loads(FAILURES.read_text(encoding='utf-8'))
+    if time.time() >= data.get('until',0) and data.get('failed',0)>=5:
+        data={'failed':0,'until':0.0}
+    return data
+
+
+def record_bad_pin():
+    state=check_lockout()
+    if time.time()-state.get('first',time.time())>3600:
+        state={'failed':0,'until':0.0,'first':time.time()}
+    state.setdefault('first',time.time())
+    state['failed']+=1
+    if state['failed']>=5:
+        state['until']=time.time()+LOGIN_LOCK_SECONDS
+    PRIVATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    FAILURES.write_text(json.dumps(state),encoding='utf-8')
+
+
+def clear_bad_pin():
+    if FAILURES.exists():
+        FAILURES.unlink()
+
+
+def hash_token(token):
+    return hashlib.sha256(token.encode('ascii')).hexdigest()
+
+
+def authorize_token(raw, refresh=True):
+    if not raw:
+        return False
+    key=hash_token(raw)
+    now=time.monotonic()
+    global CONTROL_LAST_SEEN
+    with LOGIN_LOCK:
+        session=SESSIONS.get(key)
+        if not session:
+            return False
+        if now>session['expires'] or now-session['last_seen']>120:
+            SESSIONS.pop(key,None)
+            return False
+        if refresh:
+            session['last_seen']=now
+            CONTROL_LAST_SEEN=now
+        return True
+
+
+def bearer_token(request):
+    auth=request.headers.get('Authorization','')
+    return auth[7:] if auth.startswith('Bearer ') else ''
+
 
 
 
@@ -104,6 +200,7 @@ class ArduinoBridge:
         self.pending = {}
         self.thread = None
         self.connected = False
+        self.allow_heartbeat = True
         self.last_received = None
         self.last_error = None
         self.latest = None
@@ -210,14 +307,19 @@ class ArduinoBridge:
                     run['current_step']['paused_ms'] += max(0,uptime-started)
             elif kind == 'RUN_COMPLETE':
                 self._finish_run(db,'COMPLETED','',uptime)
+                release_watchdog()
             elif kind == 'STOPPED':
                 self._finish_run(db,'STOPPED','Operator stop',uptime)
+                release_watchdog()
             elif kind == 'FAULT':
                 self._finish_run(db,'FAULTED',parts[3] if len(parts)>3 else 'FAULT',uptime)
+                release_watchdog()
             elif kind == 'RESET':
                 self._finish_run(db,'STOPPED','Controller reset',uptime)
+                release_watchdog()
             elif kind == 'BOOT':
                 self._finish_run(db,'INTERRUPTED','Arduino reset',uptime)
+                release_watchdog()
         db.commit()
 
     def _process_line(self, line, db):
@@ -272,7 +374,7 @@ class ArduinoBridge:
                         last_ping = 0
                         while not self.stop_signal.is_set():
                             now = time.monotonic()
-                            if now-last_ping>=2:
+                            if self.allow_heartbeat and now-last_ping>=2:
                                 device.write(b'CMD,HB,PING\n')
                                 last_ping = now
                             try:
@@ -316,22 +418,61 @@ class ArduinoBridge:
 bridge = ArduinoBridge()
 
 
+def control_watchdog(stop_event):
+    # Stop a manual output or recipe if the controlling browser disappears.
+    global CONTROL_ACTIVE
+    while not stop_event.wait(2):
+        with LOGIN_LOCK:
+            expired=CONTROL_ACTIVE and time.monotonic()-CONTROL_LAST_SEEN>CONTROL_LEASE_SECONDS
+            if expired:
+                CONTROL_ACTIVE=False
+                SESSIONS.clear()
+        if expired:
+            try:
+                with bridge.control_lock:
+                    bridge.command('STOP',timeout=4.0)
+                print('SAFETY STOP: operator browser heartbeat expired',flush=True)
+            except Exception as exc:
+                bridge.allow_heartbeat=False
+                print(f'SAFETY WARNING: STOP acknowledgement unavailable: {exc}. Heartbeats suspended so Arduino watchdog can trip.',flush=True)
+
+
+def arm_watchdog():
+    global CONTROL_ACTIVE, CONTROL_LAST_SEEN
+    with LOGIN_LOCK:
+        CONTROL_ACTIVE=True
+        CONTROL_LAST_SEEN=time.monotonic()
+
+
+def release_watchdog():
+    global CONTROL_ACTIVE
+    with LOGIN_LOCK:
+        CONTROL_ACTIVE=False
+
+
+
 @asynccontextmanager
 async def lifespan(app:FastAPI):
     init_db()
     bridge.start()
+    lease_stop=threading.Event()
+    lease_thread=threading.Thread(target=control_watchdog,args=(lease_stop,),daemon=True,name='OperatorLeaseWatchdog')
+    lease_thread.start()
     print('\n' + '=' * 62, flush=True)
-    print(' AUTOLAB SCADA - PRIVATE LOCAL CONTROL', flush=True)
-    print(f' Pairing code: {PAIR_CODE}', flush=True)
-    print(' Enter this code in the GitHub Pages dashboard to unlock', flush=True)
-    print(' physical motor / fan control. Never share this code.', flush=True)
+    print(' AUTOLAB SCADA - LOCAL BRIDGE (PRIVATE PIN)', flush=True)
+    print(' PIN configured: ' + ('YES' if current_credentials() else 'NO: run python backend/setup_pin.py'), flush=True)
+    print(' Remote tunnel: ' + (PUBLIC_URL if PUBLIC_URL else 'NOT CONFIGURED'), flush=True)
+    print(' Keep power isolation accessible; do not expose until configured.', flush=True)
     print('=' * 62 + '\n', flush=True)
     yield
+    lease_stop.set()
+    lease_thread.join(timeout=2)
     bridge.stop()
 
 
-app = FastAPI(title='AutoLab SCADA — Local Hardware API',version='stable',lifespan=lifespan)
-app.add_middleware(TrustedHostMiddleware,allowed_hosts=['127.0.0.1','localhost'])
+app = FastAPI(title='AutoLab SCADA — Hardware API',version='stable',lifespan=lifespan,
+                 docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(TrustedHostMiddleware,allowed_hosts=['127.0.0.1','localhost'] + ([REMOTE_HOST] if REMOTE_HOST else []))
 app.add_middleware(CORSMiddleware,allow_origins=sorted(APP_ORIGINS),
                    allow_methods=['GET','POST','OPTIONS'],allow_headers=['Authorization','Content-Type'],
                    allow_credentials=False,max_age=300)
@@ -357,17 +498,16 @@ async def restrict_cross_site_commands(request:Request,call_next):
         if origin is None and request.headers.get('sec-fetch-site') == 'cross-site':
             return Response('Cross-site commands blocked',status_code=403)
     response = await call_next(request)
+    if request.url.path.startswith('/api/'):
+        response.headers['Cache-Control']='no-store'
     if origin in APP_ORIGINS:
         response.headers['Access-Control-Allow-Private-Network']='true'
     return response
 
 
 def require_control(request:Request):
-    global AUTH_UNTIL
-    auth=request.headers.get('Authorization','')
-    supplied=auth[7:] if auth.startswith('Bearer ') else ''
-    if not (time.monotonic()<AUTH_UNTIL and secrets.compare_digest(supplied,CONTROL_TOKEN)):
-        raise HTTPException(401, 'Pair this browser with the local controller first')
+    if not authorize_token(bearer_token(request)):
+        raise HTTPException(401, 'Private control session invalid or expired. Log in again.')
 
 
 class PairRequest(BaseModel):
@@ -376,23 +516,38 @@ class PairRequest(BaseModel):
 
 @app.post('/api/pair')
 def pair(payload:PairRequest,request:Request):
-    global AUTH_UNTIL
-    now=time.monotonic()
-    while PAIR_FAILURES and PAIR_FAILURES[0]<now-60:
-        PAIR_FAILURES.popleft()
-    if len(PAIR_FAILURES)>=5:
-        raise HTTPException(429,'Too many attempts. Wait one minute.')
-    if not secrets.compare_digest(payload.code,PAIR_CODE):
-        PAIR_FAILURES.append(now)
-        raise HTTPException(401,'Incorrect pairing code')
-    AUTH_UNTIL=now+8*3600
-    return Response(json.dumps({'token':CONTROL_TOKEN,'expires_in_seconds':8*3600}),
+    global CONTROL_LAST_SEEN
+    with LOGIN_LOCK:
+        if not current_credentials():
+            raise HTTPException(503,'Operator PIN has not been configured on the laptop')
+        state=check_lockout()
+        if state.get('until',0)>time.time():
+            raise HTTPException(429,'Too many incorrect codes. Try again in one hour.')
+        if not correct_pin(payload.code):
+            record_bad_pin()
+            raise HTTPException(401,'Incorrect code')
+        ready=bridge.status()
+        if not (ready['serial_connected'] and ready['telemetry_fresh'] and bridge.allow_heartbeat):
+            raise HTTPException(503,'Arduino is offline. Controls are unavailable.')
+        clear_bad_pin()
+        raw=secrets.token_urlsafe(36)
+        now=time.monotonic()
+        SESSIONS[hash_token(raw)]={'expires':now+SESSION_SECONDS,'last_seen':now}
+        CONTROL_LAST_SEEN=now
+    return Response(json.dumps({'token':raw,'expires_in_seconds':SESSION_SECONDS}),
                     media_type='application/json',headers={'Cache-Control':'no-store'})
 
 
 @app.get('/api/control-session')
 def control_session(_:None=Depends(require_control)):
     return {'authorized':True}
+
+
+@app.post('/api/logout')
+def logout(request:Request, _:None=Depends(require_control)):
+    with LOGIN_LOCK:
+        SESSIONS.pop(hash_token(bearer_token(request)),None)
+    return {'ok':True}
 
 
 class Toggle(BaseModel):
@@ -428,32 +583,57 @@ def send(action):
 
 
 @app.get('/api/status')
-def status():
-    return bridge.status()
+def status(request:Request):
+    data=bridge.status()
+    if authorize_token(bearer_token(request)):
+        return data
+    # Public visitors can see connectivity without seeing sensor data or actuator states.
+    ready=bool(data['serial_connected'] and data['telemetry_fresh'])
+    return {'serial_connected':data['serial_connected'], 'telemetry_fresh':ready,
+            'telemetry':({'mode':'IDLE','step':0,'cycle':0,'uptime_ms':0,'sequence':0,
+                          'ds18b20_c':None,'mlx90614_c':None,'motor':False,'fan':False,
+                          'fault':'NONE','recorded_at':now_iso()} if ready else None),
+            'active_run':None,'recent_events':[],'last_error':None}
+
 
 
 @app.post('/api/motor')
 def motor(payload:Toggle, _:None=Depends(require_control)):
     with bridge.control_lock:
-        return send('MOTOR,ON' if payload.on else 'MOTOR,OFF')
+        result=send('MOTOR,ON' if payload.on else 'MOTOR,OFF')
+        if payload.on: arm_watchdog()
+        else:
+            snapshot=bridge.status().get('telemetry') or {}
+            if not snapshot.get('fan'): release_watchdog()
+        return result
 
 
 @app.post('/api/fan')
 def fan(payload:Toggle, _:None=Depends(require_control)):
     with bridge.control_lock:
-        return send('FAN,ON' if payload.on else 'FAN,OFF')
+        result=send('FAN,ON' if payload.on else 'FAN,OFF')
+        if payload.on: arm_watchdog()
+        else:
+            snapshot=bridge.status().get('telemetry') or {}
+            if not snapshot.get('motor'): release_watchdog()
+        return result
 
 
 @app.post('/api/stop')
 def stop(_:None=Depends(require_control)):
     with bridge.control_lock:
-        return send('STOP')
+        result=send('STOP')
+        release_watchdog()
+        return result
 
 
 @app.post('/api/reset')
 def reset(_:None=Depends(require_control)):
     with bridge.control_lock:
-        return send('RESET')
+        result=send('RESET')
+        bridge.allow_heartbeat=True
+        release_watchdog()
+        return result
 
 
 @app.post('/api/recipe/run')
@@ -485,23 +665,28 @@ def run_recipe(recipe:Recipe, _:None=Depends(require_control)):
             try: send('STOP')
             except Exception: pass
             raise
+        arm_watchdog()
         return {'result':result,'steps':len(recipe.steps),'cycles':recipe.cycles}
 
 
 @app.post('/api/recipe/pause')
 def pause(_:None=Depends(require_control)):
     with bridge.control_lock:
-        return send('PAUSE')
+        result=send('PAUSE')
+        arm_watchdog()
+        return result
 
 
 @app.post('/api/recipe/resume')
 def resume(_:None=Depends(require_control)):
     with bridge.control_lock:
-        return send('RESUME')
+        result=send('RESUME')
+        arm_watchdog()
+        return result
 
 
 @app.get('/api/history')
-def history(limit:int=180):
+def history(limit:int=180, _:None=Depends(require_control)):
     limit=max(1,min(1800,limit))
     with db_session() as db:
         db.row_factory=sqlite3.Row
@@ -548,7 +733,7 @@ def read_run(db, row, with_samples=False):
 
 
 @app.get('/api/runs')
-def runs(limit:int=40):
+def runs(limit:int=40, _:None=Depends(require_control)):
     limit=max(1,min(100,limit))
     with db_session() as db:
         db.row_factory=sqlite3.Row
@@ -557,7 +742,7 @@ def runs(limit:int=40):
 
 
 @app.get('/api/runs/{run_id}')
-def run_detail(run_id:int):
+def run_detail(run_id:int, _:None=Depends(require_control)):
     with db_session() as db:
         db.row_factory=sqlite3.Row
         row=db.execute('SELECT * FROM runs WHERE id=?',(run_id,)).fetchone()
@@ -567,7 +752,7 @@ def run_detail(run_id:int):
 
 
 @app.get('/api/export/telemetry.csv')
-def export_telemetry(limit:int=1800):
+def export_telemetry(limit:int=1800, _:None=Depends(require_control)):
     rows=history(limit)
     stream=io.StringIO()
     writer=csv.DictWriter(stream,fieldnames=['recorded_at','sequence','uptime_ms','ds18b20_c','mlx90614_c',
@@ -579,17 +764,24 @@ def export_telemetry(limit:int=1800):
 
 @app.websocket('/ws/live')
 async def ws_live(websocket:WebSocket):
-    # Read-only streaming; commands are separately bearer-token protected.
+    # Authenticate the first message before streaming physical sensor data.
     origin=websocket.headers.get('origin')
-    if origin and origin not in APP_ORIGINS:
+    if origin not in APP_ORIGINS:
         await websocket.close(code=1008)
         return
     await websocket.accept()
     try:
+        supplied=await asyncio.wait_for(websocket.receive_text(),timeout=5.0)
+        if not authorize_token(supplied):
+            await websocket.close(code=1008)
+            return
         while True:
+            if not authorize_token(supplied):
+                await websocket.close(code=1008)
+                break
             await websocket.send_json(bridge.status())
-            await asyncio.sleep(0.5)
-    except (WebSocketDisconnect,RuntimeError):
+            await asyncio.sleep(1.0)
+    except (WebSocketDisconnect,RuntimeError,asyncio.TimeoutError):
         pass
 
 

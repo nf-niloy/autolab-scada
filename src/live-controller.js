@@ -1,8 +1,9 @@
-/** Read-only auto-discovery over loopback; writes require local pairing. */
+/** Public GitHub Pages frontend; private control requires a local or HTTPS tunnel backend. */
 import {duration} from './recipes.js';
+import {REMOTE_API_URL} from './remote-config.js';
 
 export const API_BASE = (typeof location !== 'undefined' && ['localhost','127.0.0.1'].includes(location.hostname) && location.port==='8000')
-  ? location.origin : 'http://127.0.0.1:8000';
+  ? location.origin : (REMOTE_API_URL || 'http://127.0.0.1:8000');
 const iso=()=>new Date().toISOString();
 const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
 const unique=(data,key)=>Array.from(new Map(data.map(v=>[v[key],v])).values());
@@ -34,7 +35,9 @@ export class LiveController {
     try{
       const headers=body===undefined?{}:{'Content-Type':'application/json'};
       if(useToken&&this.token)headers.Authorization=`Bearer ${this.token}`;
-      const response=await fetch(`${API_BASE}${path}`,{method,headers,body:body===undefined?undefined:JSON.stringify(body),signal:abort.signal,cache:'no-store',mode:'cors',targetAddressSpace:'loopback'});
+      const init={method,headers,body:body===undefined?undefined:JSON.stringify(body),signal:abort.signal,cache:'no-store',mode:'cors'};
+      if(API_BASE.startsWith('http://127.0.0.1')||API_BASE.startsWith('http://localhost'))init.targetAddressSpace='loopback';
+      const response=await fetch(`${API_BASE}${path}`,init);
       const data=await response.json().catch(()=>({}));
       if(!response.ok){const error=new Error(typeof data.detail==='string'?data.detail:`Request failed (${response.status})`);error.status=response.status;throw error;}
       return data;
@@ -44,16 +47,18 @@ export class LiveController {
     if(this.fetching)return;
     this.fetching=true;
     try{
-      const reply=await this.request('/api/status');
+      const reply=await this.request('/api/status','GET',undefined,!!this.token);
       const ready=!!(reply.serial_connected&&reply.telemetry_fresh&&reply.telemetry);
       this.backendOnline=true;this.lastError='';this.apply(reply,ready);
-      if(ready){
+      if(ready&&this.token){
         if(Date.now()-this.lastHistory>10000){this.lastHistory=Date.now();this.history().catch(()=>{});}
         if(Date.now()-this.lastRuns>8000){this.lastRuns=Date.now();this.runs().catch(()=>{});}
       }
     }catch(e){
-      this.backendOnline=false;this.lastError=e.name==='AbortError'?'Local server timed out':e.message;
-      this.apply(null,false);
+      if(e.status===401){this.unpair();this.lastError='Private session expired. Please log in again.';
+        this.backendOnline=true;this.apply(null,false);}
+      else{this.backendOnline=false;this.lastError=e.name==='AbortError'?'Backend timed out':e.message;
+        this.apply(null,false);}
     }finally{this.fetching=false;this.emit()}
   }
   apply(response,ready){
@@ -80,18 +85,19 @@ export class LiveController {
     }else{s.run=null;}
     s.events=unique([...(response.recent_events||[]).map(eventMessage),...s.events],'id').sort((a,b)=>new Date(b.time)-new Date(a.time)).slice(0,70);
   }
-  async history(){const data=await this.request('/api/history?limit=180');if(!Array.isArray(data))return;
+  async history(){const data=await this.request('/api/history?limit=180','GET',undefined,true);if(!Array.isArray(data))return;
     const mapped=data.map(t=>({time:t.recorded_at,sec:(t.uptime_ms||0)/1000,contact:t.ds18b20_c,infrared:t.mlx90614_c,motor:t.motor,fan:t.fan,mode:t.mode,sequence:t.sequence,source:'HARDWARE'}));
     const last=this.state.telemetry.at(-1);
     this.state.telemetry=unique([...mapped,...(last?[last]:[])],'sequence').slice(-180);this.seq++;this.emit();}
-  async runs(){const data=await this.request('/api/runs?limit=60');this.state.runs=data;this.emit();return data;}
-  async runDetail(id){return this.request(`/api/runs/${encodeURIComponent(id)}`)}
+  async runs(){const data=await this.request('/api/runs?limit=60','GET',undefined,true);this.state.runs=data;this.emit();return data;}
+  async runDetail(id){return this.request(`/api/runs/${encodeURIComponent(id)}`,'GET',undefined,true)}
   async pair(code){
     const answer=await this.request('/api/pair','POST',{code},false,6000);
     if(!answer.token)throw new Error('Pairing token missing');
-    this.token=answer.token;this.paired=true;sessionStorage.setItem('autolab-control-session',this.token);this.emit();
+    this.token=answer.token;this.paired=true;sessionStorage.setItem('autolab-control-session',this.token);await this.poll();this.emit();
   }
   unpair(){this.token='';this.paired=false;sessionStorage.removeItem('autolab-control-session');this.emit()}
+  async logout(){try{if(this.token)await this.request('/api/logout','POST',undefined,true,2000)}catch{}finally{this.unpair()}}
   async command(path,body){
     if(!this.connected)throw new Error('Arduino offline. Controls are unavailable.');
     if(!this.paired)throw new Error('Unlock controls using your private pairing code first.');

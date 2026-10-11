@@ -10,3 +10,5 @@ node_modules/
 *.sqlite3-wal
 *.sqlite3-shm
 backend/*.db
+
+backend/.local/
