@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const read=p=>readFileSync(new URL(p,import.meta.url),'utf8');
+const html=read('../index.html'),js=read('../src/app.js'),style=read('../assets/styles.css');
+assert.match(html, /Fluxora — your lab in sync/);
+assert.doesNotMatch(html, /v3\.0|v4\.0|version\s*\d/i);
+assert.match(js,/function welcomePage\(/);
+assert.match(js,/landing-pair-form/);
+assert.match(js,/function enterDemo\(/);
+assert.match(js,/function enterLive\(/);
+assert.match(js,/function modeStrip\(/);
+assert.match(js,/isLive\(\)\?live:demo/);
+assert.match(js,/Stop the real motor, fan or running recipe/);
+assert.match(js,/export-trace/);
+for(const color of ['#0E1B48','#C18DB4','#E2CAD8','#87A7D0','#27425D','#0E1F2F'])assert.ok(style.includes(color),`Missing palette color: ${color}`);
+console.log('Fluxora welcome, source separation, identity and palette checks OK');

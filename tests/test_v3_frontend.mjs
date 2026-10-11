@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+globalThis.location={hostname:'nf-niloy.github.io',origin:'https://nf-niloy.github.io',port:'',protocol:'https:'};
+const mem=new Map();globalThis.sessionStorage={getItem:k=>mem.get(k)||null,setItem:(k,v)=>mem.set(k,v),removeItem:k=>mem.delete(k)};
+const {LiveController,validateLiveRecipe,API_BASE}=await import('../src/live-controller.js');
+assert.equal(API_BASE,'http://127.0.0.1:8000');
+const recipe={name:'simple',repeats:2,steps:[{duration:5,motor:true,fan:false},{duration:5,motor:false,fan:true}]};
+assert.equal(validateLiveRecipe(recipe),null);
+assert.match(validateLiveRecipe({...recipe,steps:Array.from({length:9},()=>recipe.steps[0])}),/1–8/);
+assert.match(validateLiveRecipe({...recipe,steps:[{duration:130,motor:true,fan:false}]}),/2–120/);
+const live=new LiveController();
+assert.equal(live.connected,false);assert.equal(live.paired,false);
+live.apply({serial_connected:true,telemetry_fresh:true,telemetry:{sequence:10,recorded_at:new Date().toISOString(),uptime_ms:5000,mode:'IDLE',motor:false,fan:false,ds18b20_c:31,mlx90614_c:30,fault:'NONE'},recent_events:[]},true);
+assert.equal(live.connected,true);assert.equal(live.state.contact,31);
+assert.equal(live.state.mode,'IDLE');assert.equal(live.state.telemetry.length,1);
+console.log('v3 frontend adapter validation OK');

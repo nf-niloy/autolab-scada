@@ -12,6 +12,7 @@ import io
 import json
 import os
 import queue
+import secrets
 import sqlite3
 import threading
 import time
@@ -21,16 +22,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import serial
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 PORT = os.getenv('ARDUINO_PORT', 'COM6')
 BAUD = 115200
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(__file__).resolve().parent / 'autolab_history.sqlite3'
+# Only exact front-end origins may access this loopback-only service.
+APP_ORIGINS = {'https://nf-niloy.github.io', 'http://127.0.0.1:8000', 'http://localhost:8000'}
+PAIR_CODE = f'{secrets.randbelow(1_000_000):06d}'
+CONTROL_TOKEN = secrets.token_urlsafe(36)
+PAIR_FAILURES = deque(maxlen=50)
+AUTH_UNTIL = 0.0
+
 
 
 def now_iso():
@@ -311,23 +320,79 @@ bridge = ArduinoBridge()
 async def lifespan(app:FastAPI):
     init_db()
     bridge.start()
+    print('\n' + '=' * 62, flush=True)
+    print(' AUTOLAB SCADA - PRIVATE LOCAL CONTROL', flush=True)
+    print(f' Pairing code: {PAIR_CODE}', flush=True)
+    print(' Enter this code in the GitHub Pages dashboard to unlock', flush=True)
+    print(' physical motor / fan control. Never share this code.', flush=True)
+    print('=' * 62 + '\n', flush=True)
     yield
     bridge.stop()
 
 
-app = FastAPI(title='AutoLab SCADA — Local Hardware API',version='2.0',lifespan=lifespan)
+app = FastAPI(title='AutoLab SCADA — Local Hardware API',version='stable',lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware,allowed_hosts=['127.0.0.1','localhost'])
-
+app.add_middleware(CORSMiddleware,allow_origins=sorted(APP_ORIGINS),
+                   allow_methods=['GET','POST','OPTIONS'],allow_headers=['Authorization','Content-Type'],
+                   allow_credentials=False,max_age=300)
 
 @app.middleware('http')
 async def restrict_cross_site_commands(request:Request,call_next):
+    origin = request.headers.get('origin')
+    if request.method == 'OPTIONS' and origin in APP_ORIGINS:
+        # Some browsers send a Private Network Access preflight when an HTTPS
+        # GitHub Pages tab asks for the operator's HTTP loopback service.
+        response=Response(status_code=204)
+        response.headers.update({
+            'Access-Control-Allow-Origin':origin,
+            'Access-Control-Allow-Methods':'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers':'Authorization, Content-Type',
+            'Access-Control-Allow-Private-Network':'true',
+            'Access-Control-Max-Age':'300','Vary':'Origin',
+        })
+        return response
+    if origin and origin not in APP_ORIGINS:
+        return Response('Origin not allowed',status_code=403)
     if request.method in ('POST','PUT','PATCH','DELETE') and request.url.path.startswith('/api/'):
-        origin = request.headers.get('origin')
-        if origin and origin not in ('http://127.0.0.1:8000','http://localhost:8000'):
-            return Response('Cross-origin actuator commands are not allowed',status_code=403)
-        if request.headers.get('sec-fetch-site') == 'cross-site':
-            return Response('Cross-site actuator commands are not allowed',status_code=403)
-    return await call_next(request)
+        if origin is None and request.headers.get('sec-fetch-site') == 'cross-site':
+            return Response('Cross-site commands blocked',status_code=403)
+    response = await call_next(request)
+    if origin in APP_ORIGINS:
+        response.headers['Access-Control-Allow-Private-Network']='true'
+    return response
+
+
+def require_control(request:Request):
+    global AUTH_UNTIL
+    auth=request.headers.get('Authorization','')
+    supplied=auth[7:] if auth.startswith('Bearer ') else ''
+    if not (time.monotonic()<AUTH_UNTIL and secrets.compare_digest(supplied,CONTROL_TOKEN)):
+        raise HTTPException(401, 'Pair this browser with the local controller first')
+
+
+class PairRequest(BaseModel):
+    code:str=Field(min_length=6,max_length=6)
+
+
+@app.post('/api/pair')
+def pair(payload:PairRequest,request:Request):
+    global AUTH_UNTIL
+    now=time.monotonic()
+    while PAIR_FAILURES and PAIR_FAILURES[0]<now-60:
+        PAIR_FAILURES.popleft()
+    if len(PAIR_FAILURES)>=5:
+        raise HTTPException(429,'Too many attempts. Wait one minute.')
+    if not secrets.compare_digest(payload.code,PAIR_CODE):
+        PAIR_FAILURES.append(now)
+        raise HTTPException(401,'Incorrect pairing code')
+    AUTH_UNTIL=now+8*3600
+    return Response(json.dumps({'token':CONTROL_TOKEN,'expires_in_seconds':8*3600}),
+                    media_type='application/json',headers={'Cache-Control':'no-store'})
+
+
+@app.get('/api/control-session')
+def control_session(_:None=Depends(require_control)):
+    return {'authorized':True}
 
 
 class Toggle(BaseModel):
@@ -368,31 +433,31 @@ def status():
 
 
 @app.post('/api/motor')
-def motor(payload:Toggle):
+def motor(payload:Toggle, _:None=Depends(require_control)):
     with bridge.control_lock:
         return send('MOTOR,ON' if payload.on else 'MOTOR,OFF')
 
 
 @app.post('/api/fan')
-def fan(payload:Toggle):
+def fan(payload:Toggle, _:None=Depends(require_control)):
     with bridge.control_lock:
         return send('FAN,ON' if payload.on else 'FAN,OFF')
 
 
 @app.post('/api/stop')
-def stop():
+def stop(_:None=Depends(require_control)):
     with bridge.control_lock:
         return send('STOP')
 
 
 @app.post('/api/reset')
-def reset():
+def reset(_:None=Depends(require_control)):
     with bridge.control_lock:
         return send('RESET')
 
 
 @app.post('/api/recipe/run')
-def run_recipe(recipe:Recipe):
+def run_recipe(recipe:Recipe, _:None=Depends(require_control)):
     with bridge.control_lock:
         data = bridge.status()
         if bridge.active_run is not None or not data['telemetry_fresh'] or not data['telemetry'] or data['telemetry']['mode'] != 'IDLE':
@@ -424,13 +489,13 @@ def run_recipe(recipe:Recipe):
 
 
 @app.post('/api/recipe/pause')
-def pause():
+def pause(_:None=Depends(require_control)):
     with bridge.control_lock:
         return send('PAUSE')
 
 
 @app.post('/api/recipe/resume')
-def resume():
+def resume(_:None=Depends(require_control)):
     with bridge.control_lock:
         return send('RESUME')
 
@@ -514,9 +579,9 @@ def export_telemetry(limit:int=1800):
 
 @app.websocket('/ws/live')
 async def ws_live(websocket:WebSocket):
-    # Same-origin websocket from the localhost app only.
+    # Read-only streaming; commands are separately bearer-token protected.
     origin=websocket.headers.get('origin')
-    if origin and origin not in ('http://127.0.0.1:8000','http://localhost:8000'):
+    if origin and origin not in APP_ORIGINS:
         await websocket.close(code=1008)
         return
     await websocket.accept()

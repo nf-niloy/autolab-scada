@@ -1,60 +1,21 @@
-# AutoLab SCADA v2 — Local Arduino Live Mode
+# AutoLab SCADA · Public-page-to-local Arduino mode
 
-## Safety boundary
+## Intended workflow
 
-- **GitHub Pages is DEMO ONLY.** No public Arduino control and no localhost bridge calls from the public site.
-- **Real hardware controls are available only from `http://127.0.0.1:8000/`** on the laptop connected by USB. The server must bind to `127.0.0.1`, not `0.0.0.0`.
-- A browser STOP button is **not an emergency-stop circuit**. Keep independent physical power isolation accessible. Verify relay polarity, power supply and inductive-load protection before operating a motor/fan.
-- The frontend reports **Arduino-commanded relay output states**, not measured contact closure, RPM or current.
-- Live temperature values are **measured**, Demo Mode sensor values are **simulated**. Each mode is labeled.
+1. Serve the frontend as a static GitHub Pages site (HTTPS).
+2. Start the FastAPI + PySerial service locally on `127.0.0.1:8000`.
+3. If Chrome requests Local Network Access / loopback permission, allow it for this site.
+4. Frontend polls `http://127.0.0.1:8000/api/status` about every 1.8 seconds.
+5. Backend connected + fresh Arduino telemetry → welcome `SYSTEM LIVE` status, with real readings after private login. No backend → demo is available; backend but no Arduino → Arduino offline with simulation available.
+6. Operator takes the short pairing code from the backend terminal and unlocks controls. Backend authorizes using a bearer token held in sessionStorage in this tab. Browser permission alone never authorizes actuator commands.
+7. Live HTTP POST endpoints go to the loopback backend, which in turn sends framed serial commands to the Uno; polling updates output states and progress.
 
-## One-time setup — Windows
+### Practical limitations
 
-1. Back up `D:\autolab-scada` before copying updated files. Keep your `backend/autolab_history.sqlite3` database.
-2. Copy the v2 ZIP contents into `D:\autolab-scada`, replacing existing `src/`, `assets/`, `index.html`, `backend/main.py`, and docs files. **Do not delete your old database.**
-3. Open CMD in `D:\autolab-scada` and install: `python -m pip install -r backend\requirements.txt`.
-4. Confirm Arduino Uno is plugged in, `COM6` is correct, Arduino IDE Serial Monitor is closed, and no `serial_test.py` process is running.
-5. Run `run_live.bat` or: `python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000` from `D:\autolab-scada`.
-6. Browse **http://127.0.0.1:8000/**. It starts in Demo Mode. The header offers **Connect Arduino**. Confirm to enter Live Mode.
-7. Start with outputs OFF. Check DS18B20 and MLX90614 readings. Test motor/fan manually for a few seconds. Then try a short recipe.
-8. Return to Demo Mode only after the requested hardware STOP is acknowledged. If communication is lost, physically disconnect actuator power and recover the controller safely.
+Modern browsers can gate cross-origin access to the loopback address space behind a Local Network Access permission dialog. Browser prompts/permissions cannot be bypassed by the app. Standard cross-origin response headers are restricted to the GitHub Pages origin. Keep the Python service local, with no public port exposure.
 
-## If the port changes
+### Safety architecture
 
-PowerShell:
+Controller firmware: physical output shutdown/watchdog and mutual exclusion. Backend: strict input bounds, serialization, acknowledgement handling, pairing token, explicit CORS origin allowlist. Frontend: labels read-only vs paired mode, disables stale controls, never claims physical relay feedback. A physical emergency cutoff is still required.
 
-```powershell
-$env:ARDUINO_PORT = 'COM7'
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
-```
-
-CMD:
-
-```cmd
-set ARDUINO_PORT=COM7
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
-```
-
-## Validation and event timing
-
-API endpoints under `/docs` remain available for diagnostics. SQLite stores telemetry, events, runs and firmware step timestamps. The original telemetry table is preserved and extended by new `events`, `runs` and `run_steps` tables. Complete recipe timings are derived from successive Arduino `EVENT,...,STEP` and `EVENT,...,RUN_COMPLETE` uptime timestamps; they measure **firmware intervals**, not physical relay closure.
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /api/status` | USB + fresh telemetry + active recipe + recent events |
-| `GET /api/history` | Recorded measured telemetry |
-| `GET /api/runs` | Real process run summaries |
-| `GET /api/runs/{id}` | Run detail including measured samples + firmware step timings |
-| `GET /api/export/telemetry.csv` | Recorded telemetry CSV |
-| `POST /api/motor` | Manual motor output request |
-| `POST /api/fan` | Manual fan output request |
-| `POST /api/stop` | Request both outputs OFF |
-| `POST /api/reset` | Controller-state reset (not hardware reboot) |
-| `POST /api/recipe/run` | Upload and run 1–8 steps, 2–120 s each, 1–20 cycles |
-| `POST /api/recipe/pause` | Pause ongoing process |
-| `POST /api/recipe/resume` | Resume paused process |
-| `WS /ws/live` | Fresh telemetry/status broadcasts |
-
-### Limitations
-
-The new backend code and browser Live Mode integration have been verified syntactically and with mock tests in the authoring environment. **Physical end-to-end verification must be repeated on your Windows laptop.** Your earlier serial bridge/firmware tests do not automatically verify this revised backend. Do not assume this is a production-ready industrial safety system.
+The public site does not run Python or contain hardware credentials. The six-digit pairing code appears only in the operator's own local backend terminal. Restarting the server rotates credentials.
