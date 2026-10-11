@@ -6,3 +6,7 @@ node_modules/
 .env
 .vscode/
 .idea/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+backend/*.db

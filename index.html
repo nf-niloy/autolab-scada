@@ -40,7 +40,7 @@
     <div class="workspace">
       <header class="topbar">
         <div class="top-left"><button id="menu-toggle" class="icon-btn mobile-menu" aria-label="Open navigation" type="button"><span data-icon="menu"></span></button><span class="breadcrumb">WORKSPACE <span class="crumb-sep">/</span> <strong id="breadcrumb-current">Overview</strong></span></div>
-        <div class="top-right"><span class="top-clock" id="top-clock"></span><span class="top-divider"></span><span class="demo-chip"><span class="live-pulse"></span> DEMO MODE</span><span class="top-avatar">A</span></div>
+        <div class="top-right"><span class="top-clock" id="top-clock"></span><span class="top-divider"></span><button type="button" class="mode-toggle" id="mode-switch" data-action="toggle-mode" hidden>○ DEMO · Connect Arduino</button><span class="demo-chip"><span class="live-pulse"></span> DEMO MODE</span><span class="top-avatar">A</span></div>
       </header>
       <main class="page" id="page" tabindex="-1" aria-live="off"></main>
       <footer class="global-footer"><span>© <span id="year"></span> AutoLab SCADA</span><span>Simulated telemetry · No physical hardware is controlled</span></footer>
