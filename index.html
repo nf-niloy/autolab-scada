@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#08131e" />
+  <meta name="description" content="AutoLab SCADA — interactive industrial process automation demonstrator with recipe execution, telemetry, events, and analytics." />
+  <title>AutoLab SCADA — Industrial automation workspace</title>
+  <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg" />
+  <link rel="stylesheet" href="./assets/styles.css" />
+</head>
+<body>
+  <div class="app-shell" id="shell">
+    <div class="mobile-backdrop" id="mobile-backdrop"></div>
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#/overview" aria-label="AutoLab SCADA home">
+        <span class="brand-mark"><svg viewBox="0 0 40 40" fill="none" aria-hidden="true"><rect x="7" y="7" width="26" height="26" rx="8" stroke="currentColor" stroke-width="2.7"/><path d="M12 20h5l3-7 4 14 3-7h2" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/></svg></span>
+        <span><strong>autolab<span class="accent-dot">.</span></strong><small>SCADA WORKSPACE</small></span>
+      </a>
+      <div class="side-section-label">WORKSPACE</div>
+      <nav class="nav-group" id="main-nav">
+        <a class="nav-link active" data-route="overview" href="#/overview"><span class="nav-icon" data-icon="layout"></span><span>Overview</span></a>
+        <a class="nav-link" data-route="control" href="#/control"><span class="nav-icon" data-icon="sliders"></span><span>Control room</span><span class="nav-dot"></span></a>
+        <a class="nav-link" data-route="recipes" href="#/recipes"><span class="nav-icon" data-icon="layers"></span><span>Recipe studio</span></a>
+        <a class="nav-link" data-route="analytics" href="#/analytics"><span class="nav-icon" data-icon="chart"></span><span>Analytics</span></a>
+        <a class="nav-link" data-route="history" href="#/history"><span class="nav-icon" data-icon="history"></span><span>Run history</span></a>
+      </nav>
+      <div class="side-section-label second-label">PROJECT</div>
+      <nav class="nav-group">
+        <a class="nav-link" data-route="system" href="#/system"><span class="nav-icon" data-icon="cpu"></span><span>System & setup</span></a>
+      </nav>
+      <div class="sidebar-fill"></div>
+      <div class="hardware-panel">
+        <div class="hardware-head"><span class="live-pulse"></span> SIMULATION ONLINE</div>
+        <p>Explore the complete workflow without connecting an Arduino.</p>
+        <div class="hardware-bottom"><span>MODE</span><strong>DEMO / LOCAL</strong></div>
+      </div>
+      <div class="side-footer"><span class="operator-avatar">A</span><span><strong>AutoLab Operator</strong><small>Demo workspace · v1.0</small></span><span class="footer-ellipsis">···</span></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="top-left"><button id="menu-toggle" class="icon-btn mobile-menu" aria-label="Open navigation" type="button"><span data-icon="menu"></span></button><span class="breadcrumb">WORKSPACE <span class="crumb-sep">/</span> <strong id="breadcrumb-current">Overview</strong></span></div>
+        <div class="top-right"><span class="top-clock" id="top-clock"></span><span class="top-divider"></span><span class="demo-chip"><span class="live-pulse"></span> DEMO MODE</span><span class="top-avatar">A</span></div>
+      </header>
+      <main class="page" id="page" tabindex="-1" aria-live="off"></main>
+      <footer class="global-footer"><span>© <span id="year"></span> AutoLab SCADA</span><span>Simulated telemetry · No physical hardware is controlled</span></footer>
+    </div>
+  </div>
+  <div id="toast-root" class="toast-root" aria-live="polite"></div>
+  <dialog id="modal" class="app-dialog"><div id="modal-body"></div></dialog>
+  <script type="module" src="./src/app.js"></script>
+</body>
+</html>
